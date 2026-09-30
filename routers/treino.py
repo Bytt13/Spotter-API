@@ -1,85 +1,192 @@
-from fastapi import APIRouter, HTTPException #type: ignore
-from pydantic import BaseModel #type: ignore
+from fastapi import APIRouter, HTTPException  # type: ignore
+from openai import OpenAI  # type: ignore
+# pyrefly: ignore [missing-import]
+from google import genai
+from google.genai import types  # type: ignore
 import os
 import time
-from dotenv import load_dotenv #type: ignore
-from openai import OpenAI #type: ignore
-from google import genai
-from google.genai import types
+import uuid
+from dotenv import load_dotenv  # type: ignore
+
+from db.client import supabase
+from db.models import ChatRequest, ChatResponse
 
 load_dotenv()
 
-router = APIRouter()
+router = APIRouter(prefix="/chat", tags=["Chat"])
 
-# 1. Inicializa o cliente Primário (Groq)
+# ── Clientes de IA ────────────────────────────────────────────────────────────
+
 groq_client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
     api_key=os.getenv("GROQ_API_KEY"),
 )
 
-# 2. Inicializa o cliente Secundário (Google Gemini)
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-class SolicitacaoTreino(BaseModel):
-    mensagem_usuario: str
+# ── Prompt do agente ─────────────────────────────────────────────────────────
 
-@router.post("/gerar-treino")
-def gerar_treino(solicitacao: SolicitacaoTreino):
-    system_prompt = (
-        "Você é o Spotter, um personal trainer de elite sarcástico e focado em hipertrofia. "
-        "Responda de forma curta, técnica e direta ao criar treinos."
+SYSTEM_PROMPT = (
+    "Você é o Spotter, um personal trainer de elite focado em hipertrofia. "
+    "Você conhece o histórico de treinos, streaks e PRs do seu usuário. "
+    "Seja direto, técnico e motivador. Use linguagem próxima mas profissional. "
+    "Quando sugerir mudanças de treino, explique o motivo fisiológico brevemente."
+)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_or_create_conversation(user_id: str, conversation_id: str | None) -> str:
+    """Retorna o ID da conversa existente ou cria uma nova."""
+    if conversation_id:
+        return conversation_id
+
+    result = (
+        supabase.table("chat_conversations")
+        .insert({"user_id": user_id, "title": "Nova Conversa"})
+        .execute()
     )
-    
-    # --- TENTATIVA 1: GROQ ---
+    return result.data[0]["id"]
+
+
+def _load_history(conversation_id: str) -> list[dict]:
+    """Carrega as últimas 20 mensagens da conversa para contexto da IA."""
+    result = (
+        supabase.table("chat_messages")
+        .select("role, content")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=False)
+        .limit(20)
+        .execute()
+    )
+    return [{"role": row["role"], "content": row["content"]} for row in result.data]
+
+
+def _save_messages(conversation_id: str, user_msg: str, assistant_msg: str):
+    """Persiste a mensagem do usuário e a resposta da IA no banco."""
+    supabase.table("chat_messages").insert([
+        {
+            "conversation_id": conversation_id,
+            "role": "user",
+            "content": user_msg,
+            "message_type": "text",
+        },
+        {
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": assistant_msg,
+            "message_type": "text",
+        },
+    ]).execute()
+
+
+def _call_ai(messages: list[dict]) -> tuple[str, str]:
+    """
+    Chama Groq primeiro, Gemini como fallback.
+    Retorna (reply_text, engine_name).
+    """
+    # Tentativa 1 — Groq
     try:
-        print("[SPOTTER] Tentando Groq (Qwen 3.8 27b)...")
+        print("[SPOTTER] Tentando Groq...")
         completion = groq_client.chat.completions.create(
-            model="qwen/qwen3.8-27b",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": solicitacao.mensagem_usuario}
-            ],
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             temperature=0.7,
+            max_tokens=600,
         )
-        return {"treino_gerado": completion.choices[0].message.content, "engine": "groq"}
-        
-    except Exception as e_groq:
-        print(f"[AVISO] Groq falhou: {e_groq}")
-        
-        # --- TENTATIVA 2: GEMINI (Fallback) ---
-        # Modelos atualizados da API Gemini
-        modelos_para_tentar = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-3.5-flash-lite"]
-        
-        for nome_modelo in modelos_para_tentar:
-            try:
-                print(f"[SPOTTER] Tentando Gemini ({nome_modelo})...")
-                
-                # Adicionamos um pequeno retry manual para erro 503
-                for tentativa in range(2): 
-                    try:
-                        response = gemini_client.models.generate_content(
-                            model=nome_modelo,
-                            contents=solicitacao.mensagem_usuario,
-                            config=types.GenerateContentConfig(
-                                system_instruction=system_prompt,
-                                temperature=0.7,
-                                max_output_tokens=500,
-                            ),
-                        )
-                        return {"treino_gerado": response.text, "engine": f"gemini-{nome_modelo}"}
-                    except Exception as e:
-                        if "503" in str(e) and tentativa == 0:
-                            print("Servidor instável (503), tentando novamente em 1s...")
-                            time.sleep(1)
-                            continue
-                        raise e # Se não for 503 ou segunda tentativa, lança o erro para o próximo modelo
+        return completion.choices[0].message.content, "groq"
+    except Exception as e:
+        print(f"[AVISO] Groq falhou: {e}")
 
-            except Exception as e_gemini:
-                print(f"[AVISO] Erro no modelo {nome_modelo}: {e_gemini}")
-                continue # Pula para o próximo modelo da lista (resolve o 404)
+    # Tentativa 2 — Gemini (fallback)
+    models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+    for model_name in models_to_try:
+        try:
+            print(f"[SPOTTER] Tentando Gemini ({model_name})...")
+            # Gemini não suporta role=system no contents, usamos system_instruction
+            gemini_messages = [
+                types.Content(
+                    role=m["role"] if m["role"] != "assistant" else "model",
+                    parts=[types.Part(text=m["content"])]
+                )
+                for m in messages
+            ]
+            for attempt in range(2):
+                try:
+                    response = gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=gemini_messages,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            temperature=0.7,
+                            max_output_tokens=600,
+                        ),
+                    )
+                    return response.text, f"gemini-{model_name}"
+                except Exception as e:
+                    if "503" in str(e) and attempt == 0:
+                        time.sleep(1)
+                        continue
+                    raise e
+        except Exception as e:
+            print(f"[AVISO] Gemini {model_name} falhou: {e}")
+            continue
 
-        # Se chegar aqui, tudo falhou
-        raise HTTPException(
-            status_code=500, 
-            detail="Nenhum motor de IA disponível no momento."
-        )
+    raise HTTPException(status_code=503, detail="Nenhum motor de IA disponível no momento.")
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/message", response_model=ChatResponse)
+def send_message(req: ChatRequest):
+    """
+    Endpoint principal do chat.
+    - Cria ou retoma uma conversa
+    - Carrega histórico para contexto
+    - Chama a IA
+    - Salva tudo no banco
+    """
+    # 1. Conversa
+    conv_id = _get_or_create_conversation(req.user_id, req.conversation_id)
+
+    # 2. Histórico para contexto
+    history = _load_history(conv_id)
+    history.append({"role": "user", "content": req.message})
+
+    # 3. IA
+    reply, engine = _call_ai(history)
+
+    # 4. Persiste no banco
+    _save_messages(conv_id, req.message, reply)
+
+    return ChatResponse(
+        conversation_id=conv_id,
+        reply=reply,
+        engine=engine,
+    )
+
+
+@router.get("/conversations/{user_id}")
+def list_conversations(user_id: str):
+    """Lista todas as conversas de um usuário (para histórico no app)."""
+    result = (
+        supabase.table("chat_conversations")
+        .select("id, title, created_at, updated_at")
+        .eq("user_id", user_id)
+        .eq("is_archived", False)
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@router.get("/conversations/{conversation_id}/messages")
+def get_messages(conversation_id: str):
+    """Retorna todas as mensagens de uma conversa específica."""
+    result = (
+        supabase.table("chat_messages")
+        .select("id, role, content, message_type, created_at")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return result.data
