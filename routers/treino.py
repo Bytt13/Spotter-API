@@ -7,7 +7,7 @@ import os
 import time
 import uuid
 from dotenv import load_dotenv  # type: ignore
-
+from pydantic import BaseModel #type: ignore
 from db.client import supabase
 from db.models import ChatRequest, ChatResponse
 
@@ -194,7 +194,7 @@ def get_messages(conversation_id: str):
 
 # ── Endpoint Legado (Compatibilidade com Flutter) ─────────────────────────────
 
-from pydantic import BaseModel
+
 
 legacy_router = APIRouter(tags=["Legacy"])
 
