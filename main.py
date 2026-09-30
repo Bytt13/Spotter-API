@@ -21,6 +21,7 @@ app.add_middleware(
 )
 
 app.include_router(treino.router)
+app.include_router(treino.legacy_router)
 
 @app.get("/health")
 def health_check():

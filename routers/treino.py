@@ -86,9 +86,9 @@ def _call_ai(messages: list[dict]) -> tuple[str, str]:
     """
     # Tentativa 1 — Groq
     try:
-        print("[SPOTTER] Tentando Groq...")
+        print("[SPOTTER] Tentando Groq (Qwen 3.8 27b)...")
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="qwen/qwen3.8-27b",
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             temperature=0.7,
             max_tokens=600,
@@ -98,7 +98,7 @@ def _call_ai(messages: list[dict]) -> tuple[str, str]:
         print(f"[AVISO] Groq falhou: {e}")
 
     # Tentativa 2 — Gemini (fallback)
-    models_to_try = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+    models_to_try = ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest"]
     for model_name in models_to_try:
         try:
             print(f"[SPOTTER] Tentando Gemini ({model_name})...")
@@ -190,3 +190,22 @@ def get_messages(conversation_id: str):
         .execute()
     )
     return result.data
+
+
+# ── Endpoint Legado (Compatibilidade com Flutter) ─────────────────────────────
+
+from pydantic import BaseModel
+
+legacy_router = APIRouter(tags=["Legacy"])
+
+class SolicitacaoTreino(BaseModel):
+    mensagem_usuario: str
+
+@legacy_router.post("/gerar-treino")
+def gerar_treino(solicitacao: SolicitacaoTreino):
+    """
+    Endpoint legado para manter compatibilidade com o frontend em Flutter.
+    Recebe a mensagem, gera o treino e retorna sem salvar no banco de dados.
+    """
+    reply, engine = _call_ai([{"role": "user", "content": solicitacao.mensagem_usuario}])
+    return {"treino_gerado": reply, "engine": engine}
